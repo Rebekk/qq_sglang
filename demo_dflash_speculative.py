@@ -143,6 +143,41 @@ def run_client_mode(server_url=SERVER_URL):
 
 
 # ─────────────────────────────────────────────
+# 辅助：用一个 engine 跑 benchmark，返回指标
+# ─────────────────────────────────────────────
+def _benchmark_engine(engine, prompts, sampling_params, label: str):
+    # warm-up：先跑一次让 cuda graph 生效
+    engine.generate(prompts[0], sampling_params)
+
+    # single request
+    t0 = time.perf_counter()
+    out = engine.generate(prompts[0], sampling_params)
+    single_elapsed = time.perf_counter() - t0
+    single_tok = out["meta_info"]["completion_tokens"]
+    single_tps = single_tok / single_elapsed
+
+    # batch
+    t0 = time.perf_counter()
+    outputs = engine.generate(prompts, sampling_params)
+    batch_elapsed = time.perf_counter() - t0
+    batch_tok = sum(o["meta_info"]["completion_tokens"] for o in outputs)
+    batch_tps = batch_tok / batch_elapsed
+
+    print(f"\n{'─'*50}")
+    print(f"  {label}")
+    print(f"{'─'*50}")
+    print(f"  Single request : {single_tok} tokens in {single_elapsed:.2f}s  → {single_tps:.1f} tok/s")
+    print(f"  Batch ({len(prompts)} reqs) : {batch_tok} tokens in {batch_elapsed:.2f}s  → {batch_tps:.1f} tok/s")
+
+    return {
+        "single_tps": single_tps,
+        "batch_tps": batch_tps,
+        "single_elapsed": single_elapsed,
+        "batch_elapsed": batch_elapsed,
+    }
+
+
+# ─────────────────────────────────────────────
 # 模式 2：引擎模式（在进程内启动 SGLang Engine）
 # ─────────────────────────────────────────────
 def run_engine_mode():
@@ -191,6 +226,56 @@ def run_engine_mode():
 
     engine.shutdown()
     print("\n✓ Demo completed.")
+
+
+# ─────────────────────────────────────────────
+# 模式 3b：速度对比（DFlash vs 无 speculative）
+# ─────────────────────────────────────────────
+def run_benchmark_mode():
+    import sglang as sgl
+
+    print("=" * 60)
+    print("DFlash vs Baseline Speed Benchmark")
+    print("=" * 60)
+    print(f"Target model : {TARGET_MODEL}")
+    print(f"Draft model  : {DRAFT_MODEL}")
+
+    sampling_params = {"temperature": 0, "max_new_tokens": 64}
+
+    # ── Baseline（无 speculative decoding）────────────────────────
+    print("\n[Phase 1] Baseline — no speculative decoding")
+    print("Loading target model only…")
+    baseline_engine = sgl.Engine(
+        model_path=TARGET_MODEL,
+        attention_backend="flashinfer",
+    )
+    baseline_stats = _benchmark_engine(baseline_engine, PROMPTS, sampling_params, "Baseline (no speculative)")
+    baseline_engine.shutdown()
+
+    # ── DFlash ──────────────────────────────────────────────────
+    print("\n[Phase 2] DFlash speculative decoding")
+    print("Loading target + draft model…")
+    dflash_engine = sgl.Engine(
+        model_path=TARGET_MODEL,
+        speculative_algorithm="DFLASH",
+        speculative_draft_model_path=DRAFT_MODEL,
+        attention_backend="flashinfer",
+        page_size=1,
+    )
+    dflash_stats = _benchmark_engine(dflash_engine, PROMPTS, sampling_params, "DFlash speculative decoding")
+    dflash_engine.shutdown()
+
+    # ── 汇总对比 ─────────────────────────────────────────────────
+    print("\n" + "=" * 50)
+    print("  Summary")
+    print("=" * 50)
+    for label, key in [("Single request", "single_tps"), ("Batch", "batch_tps")]:
+        base = baseline_stats[key]
+        spec = dflash_stats[key]
+        speedup = spec / base
+        print(f"  {label:16s}: baseline={base:6.1f} tok/s  dflash={spec:6.1f} tok/s  speedup={speedup:.2f}x")
+    print("=" * 50)
+    print("\n✓ Benchmark completed.")
 
 
 # ─────────────────────────────────────────────
@@ -311,12 +396,13 @@ def main():
     parser = argparse.ArgumentParser(description="DFlash Speculative Decoding Demo")
     parser.add_argument(
         "--mode",
-        choices=["client", "engine", "unit"],
+        choices=["client", "engine", "unit", "benchmark"],
         default="unit",
         help=(
-            "client : 连接已运行的 SGLang 服务器 (需先手动启动)\n"
-            "engine : 在进程内启动 SGLang Engine (需要 GPU + 模型权重)\n"
-            "unit   : 仅运行核心算法单元测试，无需 GPU 或模型 (默认)"
+            "client    : 连接已运行的 SGLang 服务器 (需先手动启动)\n"
+            "engine    : 在进程内启动 SGLang Engine (需要 GPU + 模型权重)\n"
+            "benchmark : DFlash vs 无 speculative 速度对比\n"
+            "unit      : 仅运行核心算法单元测试，无需 GPU 或模型 (默认)"
         ),
     )
     parser.add_argument("--url", default=SERVER_URL, help="Server URL (client mode)")
@@ -326,6 +412,8 @@ def main():
         run_client_mode(server_url=args.url)
     elif args.mode == "engine":
         run_engine_mode()
+    elif args.mode == "benchmark":
+        run_benchmark_mode()
     else:
         run_unit_test()
 
