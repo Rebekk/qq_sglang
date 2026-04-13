@@ -181,7 +181,7 @@ def run_engine_mode():
     t0 = time.perf_counter()
     outputs = engine.generate(PROMPTS, sampling_params)
     elapsed = time.perf_counter() - t0
-    total_tok = sum(len(o["meta_info"]["completion_tokens"]) for o in outputs
+    total_tok = sum(o["meta_info"]["completion_tokens"] for o in outputs
                     if "meta_info" in o and "completion_tokens" in o["meta_info"])
     for prompt, out in zip(PROMPTS, outputs):
         p_short = repr(prompt)[:50]
